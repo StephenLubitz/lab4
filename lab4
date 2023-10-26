@@ -1,0 +1,606 @@
+module pulse_generator (
+    input wire [1:0] MODE,
+    input wire START,
+    input wire STOP,
+    input wire clk100Mhz,
+    input wire reset,
+    output reg pulse
+);
+
+    reg [31:0] counter = 32'd0; // 32-bit counter
+    reg running = 1'b0; // State of the pulse generator
+    
+    // Debouncer for START and STOP button
+    wire start_debounced;
+    wire stop_debounced;
+    debouncer start_debouncer (
+        .clk100Mhz(clk100Mhz),
+        .reset(reset),
+        .i_sig(START),
+        .o_sig_debounced(start_debounced)
+    );
+    debouncer stop_debouncer (
+        .clk100Mhz(clk100Mhz),
+        .reset(reset),
+        .i_sig(STOP),
+        .o_sig_debounced(stop_debounced)
+    );
+
+    always @(posedge clk100Mhz) begin
+        pulse <= 1'b0;
+        if (reset) begin
+            running <= 1'b0;                                               // Reset running state
+            counter <= 32'd0;                                              // Reset counter
+            pulse <= 1'b0;                                                 // Reset pulse output
+        end else begin
+            if (start_debounced) begin
+                running <= 1'b1;                                           // Start pulsing
+            end
+            if (stop_debounced) begin
+                running <= 1'b0;                                           // Stop pulsing
+            end
+            if (running) begin
+                case (MODE)
+                    2'b00: begin                                            // Walk mode, 32 pulses per second
+                        if (counter == 3125000) begin                       // 100M/32
+                            pulse <= ~pulse;
+                            counter <= 0;
+                        end else begin 
+                            counter <= counter + 1;
+                        end
+                    end
+                    2'b01: begin                                           // Jog mode, 64 pulses per second
+                        if (counter == 1562500) begin                      // 100M/64
+                            pulse <= ~pulse;
+                            counter <= 0;
+                        end else begin 
+                            counter <= counter + 1;
+                        end
+                    end
+                    2'b10: begin                                          // Run mode, 128 pulses per second
+                        if (counter == 781250) begin // 100M/128
+                            pulse <= ~pulse;
+                            counter <= 0;
+                        end else begin 
+                            counter <= counter + 1;
+                        end
+                    end
+                    2'b11: begin                                           // Off mode
+                        pulse <= 1'b0;
+                        counter <= 0;
+                    end
+                    default: begin                                          // Should not happen
+                        pulse <= 1'b0;
+                        counter <= 0;
+                    end
+                endcase
+            end else begin
+                pulse <= 1'b0;                                              // No pulses when not running
+                counter <= 0;                                                // Reset counter
+            end
+        end
+    end
+endmodule
+
+
+
+
+module Tracker(
+    input wire clk100Mhz,                   // Clock signal (100MHz)
+    input wire reset,                       // Synchronous reset
+    input wire pulse_in,                    // Pulse input from the PulseGenerator
+    output reg [31:0] steps_display,        // Step count for display
+    output wire [4:0] distance_out,         // Distance in binary encoding using 5 bits to handle the 20 cases 0-9.5 in 0.5 increments
+    output wire OFLOW,                      // Overflow flag
+    output wire [26:0] true_steps_out,
+    output wire [3:0] steps_display1,        // BCD output for the least significant digit
+    output wire [3:0] steps_display2,        // BCD output for the second digit
+    output wire [3:0] steps_display3,        // BCD output for the third digit
+    output wire [3:0] steps_display4        // BCD output for the most significant digit
+);
+    reg [4:0] distance_int;                 //internal register holds the distance value for later use
+    // Internal counters
+    reg [26:0] true_steps = 0;              // 27 bits max value 134217728 to cover 2 minutes of maximum pulse rate
+                                            //781250 pulses in 1 second * 120 seconds = 93750000 puleses in 2mins
+    // Constants
+    parameter HALF_MILE_STEPS = 2048;       //parameter for counting the increments of 0.5miles to be displayed as distance traveled
+    // Connect the BCD module to the Tracker module
+    wire CO_out;                            // Carry Out signal from the BCD module
+
+    bcd_4digit BCD(
+    .D1(steps_display[3:0]),
+    .D2(steps_display[7:4]),
+    .D3(steps_display[11:8]),
+    .D4(steps_display[15:12]),
+    .ENABLE(1'b1),                              // Always enabled
+    .LOAD(1'b0),                                // Assuming you don't need to load initial values
+    .UP(1'b1),                                   // Incrementing mode
+    .clk100Mhz(clk100Mhz),
+    .reset(reset),
+    .Q1(steps_display1),
+    .Q2(steps_display2),
+    .Q3(steps_display3),
+    .Q4(steps_display4),
+    .CO(CO_out)
+    );
+    always @(posedge clk100Mhz) begin
+        if (reset) begin                                          //synchronous reset 
+            true_steps <= 0;                                     // true steps increments every pulse 
+            steps_display <= 0;
+        end else if (pulse_in) begin
+            if (true_steps < 93750000) begin                      // To ensure we do not overflow beyond 2 mins at max pulse rate
+                true_steps <= true_steps + 1;
+
+                                                                   // Update the steps_display and saturate at 9999
+                if (steps_display < 9999) begin
+                    steps_display <= steps_display + 1;
+                end
+            end
+        end
+    end
+
+    always @(posedge clk100Mhz) begin
+        if (reset) begin
+            distance_int <= 5'b00000;  // 0.0 miles
+        end
+        else begin
+                                                                        // Distance calculation based on true_steps in terms of 2048 steps
+            case(true_steps >> 11)                                       //right shifting by 11 is the same as division by 2048
+                0: begin 
+                    distance_int <= 5'b00000;  // 0.0 miles
+                end
+                1: begin
+                    distance_int <= 5'b00001;  // 0.5 miles
+                end
+                2: begin
+                    distance_int <= 5'b00010;  // 1.0 miles
+                end
+                3: begin
+                    distance_int <= 5'b00011;  // 1.5 miles
+                end
+                4: begin
+                    distance_int <= 5'b00100;  // 2.0 miles
+                end
+                5: begin 
+                    distance_int <= 5'b00101;  // 2.5 miles
+                end
+                6: begin 
+                    distance_int <= 5'b00110;  // 3.0 miles
+                end
+                7: begin 
+                    distance_int <= 5'b00111;  // 3.5 miles
+                end
+                8: begin 
+                    distance_int <= 5'b01000;  // 4.0 miles
+                end
+                9: begin 
+                    distance_int <= 5'b01001;  // 4.5 miles
+                end
+                10: begin 
+                    distance_int <= 5'b01010;  // 5.0 miles
+                end
+                11: begin 
+                    distance_int <= 5'b01011;  // 5.5 miles 
+                end
+                12: begin 
+                    distance_int <= 5'b01100;  // 6.0 miles
+                end
+                13: begin 
+                    distance_int <= 5'b01101;  // 6.5 miles
+                end
+                14: begin 
+                    distance_int <= 5'b01110;  // 7.0 miles
+                end
+                15: begin 
+                    distance_int <= 5'b01111;  // 7.5 miles 
+                end
+                16: begin 
+                    distance_int <= 5'b10000;  // 8.0 miles
+                end
+                17: begin 
+                    distance_int <= 5'b10001;  // 8.5 miles
+                end
+                18: begin 
+                    distance_int <= 5'b10010;  // 9.0 miles
+                end
+                19: begin 
+                    distance_int <= 5'b10011;  // 9.5 miles
+                end
+                default: begin 
+                    distance_int <= distance_int; // Keep the previous value
+                end
+            endcase
+        end
+    end
+    
+    assign distance_out = distance_int; // connect the internal register to the distance output
+    // Overflow flag
+    assign OFLOW = (steps_display == 9999 && pulse_in);
+    assign true_steps_out = true_steps;
+
+
+endmodule
+
+module debouncer #(
+   // Global Parameters  
+   parameter N_BOUNCE    =  3   ,           // Bouncing interval in clock cycles = 2^N_BOUNCE
+   parameter IS_PULLUP   =  0               // Optional: '1' for pull-up switch, '0' for pull-down switch                                              
+)
+(clk100Mhz, reset, i_sig, o_sig_debounced);
+
+   input clk100Mhz;          
+   input reset;      
+   input  i_sig;
+   output o_sig_debounced;
+
+
+    reg                isig_rg, isig_sync_rg              ;        // Registers in 2FF Synchronizer
+    reg                sig_rg, sig_d_rg, sig_debounced_rg ;        // Registers for switch's state
+    reg [N_BOUNCE : 0] counter_rg                         ;        // Couclk100Mhzr
+   
+    always @(posedge clk100Mhz)
+    begin
+       // Reset  
+       if (reset)
+       begin
+          // Internal Registers
+          sig_rg           <= IS_PULLUP ;
+          sig_d_rg         <= IS_PULLUP ;
+          sig_debounced_rg <= IS_PULLUP ;
+          counter_rg       <=  1        ;
+   
+       end
+       // Out of reset
+       else
+       begin
+          // Register state of switch      
+          sig_rg   <= isig_sync_rg  ;
+          sig_d_rg <= sig_rg        ;
+   
+          // Increment counter if two consecutive states are same, otherwise reset
+          counter_rg <= (sig_d_rg == sig_rg) ? counter_rg + 1 : 1 ;
+     
+          // Counter overflow, valid state registered
+          if (counter_rg [N_BOUNCE])
+          begin
+             sig_debounced_rg <= sig_d_rg ;
+          end
+      end
+ end
+   
+    always @(posedge clk100Mhz) begin
+       // Reset  
+       if (reset)
+       begin
+          // Internal Registers
+          isig_rg      <= IS_PULLUP ;
+          isig_sync_rg <= IS_PULLUP ;
+         
+       end
+       // Out of reset
+       else
+       begin
+          isig_rg      <= i_sig   ;        // Metastable flop
+          isig_sync_rg <= isig_rg ;        // Synchronizing flop
+       end
+    end
+    assign o_sig_debounced = sig_debounced_rg ;
+
+endmodule
+
+module bcd_1digit(D, ENABLE, LOAD, UP, clk100Mhz, reset, Q, CO);
+    input [3:0] D;
+    input ENABLE, LOAD, UP, clk100Mhz, reset;
+    
+    output reg [3:0] Q;
+    output reg CO;
+    
+    //Synchronous counter
+    //Additional logic will be implemented in the top-level module (4-digit BCD) to prevent it from going below 0 or above 9999
+    always @(posedge clk100Mhz)
+    begin
+        //Asynchronous clear
+        if(reset)
+        begin
+            Q <= 4'b0000;
+        end
+        //Implement the behavioral requirements for Q here
+        else if(ENABLE & LOAD)
+        begin
+            Q <= D;
+        end
+        else if(ENABLE && UP && Q == 4'b1001)
+        begin
+            Q <= 4'b0000;
+        end
+        else if(ENABLE && !UP && Q == 4'b0000)
+        begin
+            Q <= 4'b1001;
+        end         
+        else if(ENABLE && UP && !LOAD)
+        begin
+            Q <= Q + 1;
+        end
+        else if(ENABLE && !UP && !LOAD)
+        begin
+            Q <= Q - 1;
+        end               
+    end
+    always @(*)
+    begin  
+    CO = 0; //default assignment  
+        //Asynchronous clear
+        if(reset)
+        begin
+            CO = 0;
+        end
+        //Implement the behavioral requirements for CO here
+        else if(ENABLE)
+        begin
+            if(UP && Q == 4'b1001)
+            begin
+                CO = 1;
+            end
+            else if (!UP && Q == 4'b0000)
+            begin
+                CO = 1;
+            end
+            else
+            begin
+                CO = 0;
+            end                                
+        end
+    end
+endmodule
+
+
+module bcd_4digit(D1, D2, D3, D4, ENABLE, LOAD, UP, clk100Mhz, reset, Q1, Q2, Q3, Q4, CO);
+    
+    input [3:0] D1, D2, D3, D4;
+    input ENABLE, LOAD, UP, clk100Mhz, reset;
+    
+    output [3:0] Q1, Q2, Q3, Q4;
+    
+    output reg CO;
+   
+    wire CO_1, CO_2, CO_3;
+    reg ENABLE_1, ENABLE_2, ENABLE_3, ENABLE_4;
+    reg UP_2, UP_3, UP_4;
+    reg ENABLE_OVERRIDE;
+   
+    // module instantiation
+    bcd_1digit digit1( 
+        .D(D1), .ENABLE(ENABLE_1), .LOAD(LOAD), .UP(UP), 
+        .clk100Mhz(clk100Mhz), .reset(reset), .Q(Q1), .CO(CO_1) );
+    
+    bcd_1digit digit2( 
+        .D(D2), .ENABLE(ENABLE_2), .LOAD(LOAD), .UP(UP_2), 
+        .clk100Mhz(clk100Mhz), .reset(reset), .Q(Q2), .CO(CO_2) );
+    
+    bcd_1digit digit3( 
+        .D(D3), .ENABLE(ENABLE_3), .LOAD(LOAD), .UP(UP_3), 
+        .clk100Mhz(clk100Mhz), .reset(reset), .Q(Q3), .CO(CO_3) );
+    
+    bcd_1digit digit4( 
+        .D(D4), .ENABLE(ENABLE_4), .LOAD(LOAD), .UP(UP_4), 
+        .clk100Mhz(clk100Mhz), .reset(reset), .Q(Q4), .CO() );
+   
+    always @(*)
+    begin
+        CO <= 0;
+        if(ENABLE == 1 && (Q4 == 4'd0 && Q3 == 4'd0 && Q2 == 4'd0 && Q1 == 4'd0) && UP == 1'd0)
+        begin
+            ENABLE_1 <= 0;
+            ENABLE_2 <= 0;
+            ENABLE_3 <= 0;
+            ENABLE_4 <= 0;
+            ENABLE_OVERRIDE <= 1'd0;
+            CO <= 1;
+            UP_2 <= 0;
+            UP_3 <= 0;
+            UP_4 <= 0;
+       end
+	   else if(ENABLE == 1 && (Q4 == 4'd9 && Q3 == 4'd9 &&Q2 == 4'd9 && Q1 == 4'd9) && UP)
+	   begin
+	       ENABLE_1 <= 0;
+           ENABLE_2 <= 0;
+           ENABLE_3 <= 0;
+           ENABLE_4 <= 0;
+	       ENABLE_OVERRIDE <= 1'd0;
+	       CO <= 1;
+           UP_2 <= 1;
+           UP_3 <= 1;
+           UP_4 <= 1;
+
+	   end
+	   else
+	   begin
+	       ENABLE_OVERRIDE <= 1'd1;
+            CO <= 0;
+            if (UP && CO_1)
+            begin
+                UP_2 <= 1'd1;
+                UP_3 <= CO_2 ? 1'd1 : 1'd0;
+                UP_4 <= CO_3 ? 1'd1 : 1'd0;
+            end
+            else if (!UP && CO_1)
+            begin
+                UP_2 <= 1'd0;
+                UP_3 <= CO_2 ? 1'd0 : 1'd1;
+                UP_4 <= CO_3 ? 1'd0 : 1'd1;
+            end
+            else
+            begin
+                UP_2 <= UP;
+                UP_3 <= UP;
+                UP_4 <= UP;
+            end
+         end
+         ENABLE_1 <= (ENABLE && ENABLE_OVERRIDE) | LOAD;        //ENABLE for 1st digit
+	     ENABLE_2 <= (CO_1 && ENABLE_OVERRIDE) | LOAD;         //ENABLE for 2nd digit
+	     ENABLE_3 <= (CO_2 && ENABLE_OVERRIDE) | LOAD;         //ENABLE for 3nd digit
+	     ENABLE_4 <= (CO_3 && ENABLE_OVERRIDE) | LOAD;         //ENABLE for 4nd digit     
+  end
+endmodule
+module bcd_seven (bcd, dot, segments);
+   input	[3:0] bcd; 
+   input    dot;
+   output	[7:0] segments; 
+ 
+   reg	[6:0] seven;
+ 
+   always @(bcd)
+   begin
+      case (bcd)
+         4'b0000 : begin
+            seven = 7'b0111111 ; //0 d63  ---flip--- d64 h40
+         end
+         4'b0001 : begin
+            seven = 7'b0000110 ; // 1 d6--- flip--- d121 h79
+         end 
+         4'b0010 :begin 
+            seven = 7'b1011011 ; //2 d91---flip ----d36 h24
+         end 
+         4'b0011 : begin
+            seven = 7'b1001111 ; //3 d79 ----flip--- d48 h30
+         end 
+         4'b0100 : begin
+            seven = 7'b1100110 ; //4 d102---- flip--- d25 h19
+         end 
+         4'b0101 : begin
+            seven = 7'b1101101 ; //5 d109--- flip---- d18 h12
+         end 
+         4'b0110 : begin
+            seven = 7'b1111101 ; //6 d125 ----flip ---d2 h2
+         end 
+         4'b0111 : begin
+            seven = 7'b0000111 ; //7 d7 ---flip ---d120 h78
+         end 
+         4'b1000 : begin
+            seven = 7'b1111111 ; //8 d127--- flip ----d0 h00
+         end 
+         4'b1001 : begin
+            seven = 7'b1101111 ; //9 d111 -flip d16 h10
+         end 
+         default :  begin
+            seven = 7'b0000000 ; //blank 
+         end 
+      endcase 
+   end 
+   assign segments = {dot, seven};
+endmodule
+
+module mux_4to1 (
+    input [3:0] bcd0,   // Input for 1st BCD digit
+    input [3:0] bcd1,   // Input for 2nd BCD digit
+    input [3:0] bcd2,   // Input for 3rd BCD digit
+    input [3:0] bcd3,   // Input for 4th BCD digit
+    input [1:0] select, // 2-bit select signal
+    output reg [3:0] out_bcd // MUX output
+);
+
+always @(bcd0, bcd1, bcd2, bcd3, select) begin
+    case (select)
+        2'b00: out_bcd = bcd0;
+        2'b01: out_bcd = bcd1;
+        2'b10: out_bcd = bcd2;
+        2'b11: out_bcd = bcd3;
+    endcase
+end
+
+endmodule
+
+module four_digit_display (
+    input [15:0] bcd_input,  // 4 sets of 4-bit BCD values for each digit
+    input clk100Mhz,        // 100 MHz clock input
+    input reset,
+    output [3:0] anodes,    // Anode outputs for the 4 digits
+    output [7:1] cathodes   // Cathode outputs for the current digit
+);
+
+    reg [1:0] digit_control = 2'b00;  // Control which of the 4 digits is active
+    reg [24:0] counter = 0;            // 25-bit counter to divide 100 MHz clock to 1 kHz
+
+    wire [7:0] segments;   // The 7-segment display 
+    
+    // Splitting the 16-bit bcd_input into four 4-bit digits
+    wire [3:0] bcd0 = bcd_input[3:0];
+    wire [3:0] bcd1 = bcd_input[7:4];
+    wire [3:0] bcd2 = bcd_input[11:8];
+    wire [3:0] bcd3 = bcd_input[15:12];
+
+    // Declare the output for the MUX
+    wire [3:0] mux_output;
+
+    // Instantiate the MUX
+    mux_4to1 mux_instance (
+        .bcd0(bcd0),
+        .bcd1(bcd1),
+        .bcd2(bcd2),
+        .bcd3(bcd3),
+        .select(digit_control),
+        .out_bcd(mux_output)
+    );
+
+    // Feed the MUX output to the bcd_seven module
+    bcd_seven display_driver (
+        .bcd(mux_output),
+        .dot(1'b0),
+        .segments(segments)
+    );
+
+    always @(posedge clk100Mhz) begin
+        counter <= counter + 1;
+        if (counter == 100000-1) begin                      // Divide 100 MHz to 1 kHz
+            counter <= 0;
+            digit_control <= digit_control + 1;
+        end
+    end
+
+                                                            // Drive anode signals - active digit has a '0'
+    assign anodes = 4'b1111 ^ (1 << digit_control);
+
+                                                               // Drive cathode signals (inverted as per documentation)
+    assign cathodes = ~segments;
+
+endmodule
+
+module TopLevelModule (
+    input wire [1:0] MODE,
+    input wire START,
+    input wire STOP,
+    input wire clk100Mhz,
+    input wire reset,
+    output wire [31:0] steps_display,
+    output wire [26:0] true_steps_out,
+    output wire [3:0] anodes,     
+    output wire [7:1] cathodes
+);
+    wire pulse;
+
+    pulse_generator pulse_gen (
+        .MODE(MODE),                        // Mode input
+        .START(START),                      // Start signal
+        .STOP(STOP),                        // Stop signal
+        .clk100Mhz(clk100Mhz),              // Clock
+        .reset(reset),                      // Reset signal
+        .pulse(pulse)                       // Pulse output
+    );
+
+    Tracker tracker_inst (
+        .clk100Mhz(clk100Mhz),              // Clock signal
+        .reset(reset),                      // Reset signal
+        .pulse_in(pulse),                   // Pulse input
+        .steps_display(steps_display),      // Steps display
+        .distance_out(distance_out),        // Distance output
+        .OFLOW(OFLOW),                      // Overflow flag
+        .true_steps_out(true_steps_out)
+    );
+    four_digit_display fdd (
+        .clk100Mhz(clk100Mhz),
+        .bcd_input(steps_display),
+        .anodes(anodes),
+        .cathodes(cathodes)
+    );
+
+endmodule
